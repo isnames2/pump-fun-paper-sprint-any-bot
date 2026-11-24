@@ -65,6 +65,20 @@ export interface Params {
   staleSlots: number;
 }
 
+// Sweep notes (dev window, grade-local --driver process, 18 configs tested):
+// - First take-profit at +75% is the best of the three levels tried: +75%
+//   nets -0.0149 SOL, +50% nets -0.0152, the +25% baseline nets -0.0165.
+//   The gaps are inside the noise, so the level is not load-bearing.
+// - Bigger stakes are worse even though the win rate rises: 0.02 SOL nets
+//   -0.0239, 0.03 nets -0.0287, 0.05 nets -0.0378 (win rate up to 32%).
+//   The flat 105k-lamport tx fee shrinks per trade, but the bigger size
+//   buys into worse fills on the same thin coins.
+// - Entering later is much worse: an 8-slot entry window nets -0.0348 over
+//   51 round trips. The pump is decided in the first minutes.
+// - Looser buyer gates, a tighter trailing stop, and shorter holds all
+//   score worse. Nothing tested beats the baseline by more than noise,
+//   and every config loses on dev: the edge, if any, is in the final
+//   window's coins, not in this sample.
 export const DEFAULT_PARAMS: Params = {
   maxAgeSlots: 5,
   minRunupBps: 2000,
@@ -96,26 +110,26 @@ interface Tick {
 }
 
 interface Coin {
-  mint: Pubkey;
-  createSlot: number;
-  creator: Pubkey;
-  vq0: bigint;
-  vt0: bigint;
-  devBuy: bigint;
-  devSold: boolean;
-  buyers: Set<Pubkey>;
-  trades: number;
-  lastTradeSlot: number;
-  recent: Tick[];
-  done: boolean;
-  complete: boolean;
+  mint: Pubkey; // token address; the map key for this coin.
+  createSlot: number; // slot the CreateEvent arrived in; entry age counts from here.
+  creator: Pubkey; // dev wallet; its trades are the rug signal.
+  vq0: bigint; // virtual quote reserves at creation; the runup baseline.
+  vt0: bigint; // virtual token reserves at creation; the runup baseline.
+  devBuy: bigint; // lamports the creator bought in the create slot.
+  devSold: boolean; // true once the creator sells any amount: a rug sign.
+  buyers: Set<Pubkey>; // distinct non-creator buyers seen in any trade.
+  trades: number; // trade count since creation; the demand gate reads this.
+  lastTradeSlot: number; // slot of the latest trade; the staleness exit reads this.
+  recent: Tick[]; // sliding window of recent trades; the flow gate reads this.
+  done: boolean; // true once the coin is judged and never needs scoring again.
+  complete: boolean; // true once the curve completes (bonded or closed).
 }
 
 interface Held {
-  openedSlot: number;
-  txPaid: bigint;
-  best: bigint;
-  tookTp1: boolean;
+  openedSlot: number; // slot the buy fill landed; the time cap counts from here.
+  txPaid: bigint; // tx fees paid so far; added to the cost basis.
+  best: bigint; // best sell value seen since entry (or since the take-profit).
+  tookTp1: boolean; // true once the first partial take-profit has fired.
 }
 
 /** What selling `tokens` against (vq, vt) pays after curve fees. */
@@ -125,6 +139,81 @@ function sellValue(tokens: bigint, vq: bigint, vt: bigint): bigint {
   return q - (q * CURVE_FEE_BPS + BPS - 1n) / BPS;
 }
 
+/** Hard stop: true once the position's value is down stopLossBps below basis. */
+function stopLossHit(value: bigint, basis: bigint, p: Params): boolean {
+  return value * BPS <= basis * (BPS - BigInt(p.stopLossBps));
+}
+
+/**
+ * Trailing stop: arms once the best value seen is up trailArmBps over
+ * basis, then fires when the value falls trailBps below that best. The
+ * best is reset to zero after a partial take-profit, so the trail
+ * re-arms from the post-sale position instead of chasing the old high.
+ */
+function trailingStopHit(best: bigint, value: bigint, basis: bigint, p: Params): boolean {
+  if (best * BPS < basis * (BPS + BigInt(p.trailArmBps))) return false;
+  return value * BPS <= best * (BPS - BigInt(p.trailBps));
+}
+
+/** Hard time cap: true once the hold has lasted maxHoldSlots slots. */
+function holdExpired(openedSlot: number, slot: number, p: Params): boolean {
+  return slot - openedSlot >= p.maxHoldSlots;
+}
+
+/** Staleness exit: true when the coin has not traded for staleSlots slots. */
+function staleExit(lastTradeSlot: number, slot: number, p: Params): boolean {
+  return slot - lastTradeSlot >= p.staleSlots;
+}
+
+/** First take-profit trigger: true once value is up tp1Bps over basis. */
+function takeProfitReady(value: bigint, basis: bigint, p: Params): boolean {
+  return value * BPS >= basis * (BPS + BigInt(p.tp1Bps));
+}
+
+/**
+ * First take-profit size: tp1PartBps of the position, or zero when the
+ * part would not be a real partial sale (zero, or the whole position).
+ * Selling half early banks the win; the rest rides the trailing stop.
+ */
+function takeProfitPart(tokens: bigint, p: Params): bigint {
+  const part = (tokens * BigInt(p.tp1PartBps)) / BPS;
+  return part > 0n && part < tokens ? part : 0n;
+}
+
+/** Demand gate: enough distinct buyers and trades to prove a real crowd. */
+function meetsDemand(buyers: number, trades: number, p: Params): boolean {
+  return buyers >= p.minBuyers && trades >= p.minTrades;
+}
+
+/** Reserve gate: real SOL reserves inside [minRealSol, maxRealSol]. */
+function meetsReserves(rq: bigint, p: Params): boolean {
+  return rq >= BigInt(Math.floor(p.minRealSol * LAMPORTS)) && rq <= BigInt(Math.floor(p.maxRealSol * LAMPORTS));
+}
+
+/** Runup gate: buy only inside [minRunupBps, maxRunupBps] over create price. */
+function runupInRange(runup: bigint, p: Params): boolean {
+  return runup >= BPS + BigInt(p.minRunupBps) && runup <= BPS + BigInt(p.maxRunupBps);
+}
+
+/** Flow gate: net inflow at least minFlowSol from at least minBuyers buyers. */
+function meetsFlow(net: bigint, buyers: number, p: Params): boolean {
+  return net >= BigInt(Math.floor(p.minFlowSol * LAMPORTS)) && buyers >= p.minBuyers;
+}
+
+/** Buy size: the stake, capped at 1% of real reserves through maxBuy. */
+function sizeBuy(maxBuy: bigint, p: Params): bigint {
+  return p.stakeLamports < maxBuy ? p.stakeLamports : maxBuy;
+}
+
+/**
+ * Build the strategy: one onBatch call per batch, exits before entries.
+ * The batch carries the slot's events, marks and fills; the strategy folds
+ * the events into per-coin tapes, settles fills into Held records, exits
+ * positions that hit a rule, then scans young coins for entries. Every
+ * decision is keyed to the batch's slot, never to wall time, so the run
+ * is deterministic: the same window replays to the same orders.
+ * One buy per coin, no pyramiding; a coin judged once is marked done.
+ */
 export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: BotState, batch: Batch): OrderInput[] } {
   const coins = new Map<Pubkey, Coin>();
   const held = new Map<Pubkey, Held>();
@@ -181,7 +270,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
-      // Fold this batch's events into the per-coin tapes.
+      // Fold this batch's events into the per-coin tapes: creates open a
+      // Coin, trades extend the tape and the buyer set, completes retire it.
+      // The tape is the only memory the strategy keeps between batches.
       for (const e of batch.events) {
         if (e.event === 'CreateEvent') {
           coinOf(e.mint, e.slot, e.creator, BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves));
@@ -216,7 +307,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
         marks.set(m.mint, { vq: BigInt(m.virtual_quote_reserves), vt: BigInt(m.virtual_token_reserves) });
       }
 
-      // Fills: track buys landing, drop harness closes.
+      // Fills: track buys landing (open a Held record with the tx fee paid),
+      // drop harness closes (client ids starting with '_'), and prune Held
+      // records whose position is gone with no sell pending.
       for (const f of batch.fills) {
         if (f.client_id.startsWith('_')) {
           held.delete(f.mint);
@@ -240,7 +333,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
         }
       }
 
-      // Exits first: stop loss, partial take-profit, trailing stop, time/stale/dev.
+      // Exits first: for each open position, check the take-profit, then
+      // the stop loss, trailing stop, time cap, creator-sold and staleness
+      // exits. Exits are decided before entries so a batch never buys a
+      // coin it is about to sell, and freed cash is visible to entries.
       for (const [mint, pos] of state.positions) {
         if (orders.length >= cap) break;
         if (selling.has(mint)) continue;
@@ -262,9 +358,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
         if (basis <= 0n) continue;
 
         // Partial take-profit: sell half once up tp1Bps, re-arm the trail from here.
-        if (!h.tookTp1 && value * BPS >= basis * (BPS + BigInt(p.tp1Bps))) {
-          const part = (pos.token_amount * BigInt(p.tp1PartBps)) / BPS;
-          if (part > 0n && part < pos.token_amount) {
+        if (!h.tookTp1 && takeProfitReady(value, basis, p)) {
+          const part = takeProfitPart(pos.token_amount, p);
+          if (part > 0n) {
             orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
             selling.add(mint);
             h.tookTp1 = true;
@@ -274,13 +370,15 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
           }
         }
 
+        // Exit checks, cheapest first: hard stop, trailing stop, time cap,
+        // then the coin-level signals (creator sold, or the tape went stale).
         let exit = false;
-        if (value * BPS <= basis * (BPS - BigInt(p.stopLossBps))) exit = true;
-        if (!exit && h.best * BPS >= basis * (BPS + BigInt(p.trailArmBps)) && value * BPS <= h.best * (BPS - BigInt(p.trailBps))) exit = true;
-        if (!exit && state.slot - h.openedSlot >= p.maxHoldSlots) exit = true;
+        if (stopLossHit(value, basis, p)) exit = true;
+        if (!exit && trailingStopHit(h.best, value, basis, p)) exit = true;
+        if (!exit && holdExpired(h.openedSlot, state.slot, p)) exit = true;
         if (c !== undefined) {
           if (!exit && c.devSold) exit = true;
-          if (!exit && state.slot - c.lastTradeSlot >= p.staleSlots) exit = true;
+          if (!exit && staleExit(c.lastTradeSlot, state.slot, p)) exit = true;
         }
         if (!exit) continue;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
@@ -288,7 +386,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
         if (c !== undefined) c.done = true;
       }
 
-      // Entries: young coins with a proven runup, real inflow, several buyers, no rug signs.
+      // Entries: young coins with a proven runup, real inflow, several buyers,
+      // and no rug signs. Each coin is judged once: a coin that fails a gate
+      // is marked done, so the loop never re-scores a dead coin.
       let free = state.freeCashLamports() - tx * BigInt(orders.length);
       let open = state.committedPositionCount();
       for (const c of coins.values()) {
@@ -308,21 +408,24 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): { onBatch(state: Bot
           continue;
         }
         if (c.devBuy > BigInt(Math.floor(p.maxDevBuySol * LAMPORTS))) continue;
-        if (c.buyers.size < p.minBuyers) continue;
-        if (c.trades < p.minTrades) continue;
+        // Demand gate first: the crowd must have shown up before we buy in.
+        if (!meetsDemand(c.buyers.size, c.trades, p)) continue;
         const rq = curve.real_quote_reserves;
-        if (rq < BigInt(Math.floor(p.minRealSol * LAMPORTS)) || rq > BigInt(Math.floor(p.maxRealSol * LAMPORTS))) continue;
-        // Runup vs the create price, from the latest reserves.
+        if (!meetsReserves(rq, p)) continue;
+        // Runup gate: the coin must already be moving, but not so far that
+        // we would be chasing the top of its first pump. Read the runup off
+        // the latest reserves, guarded against zero reserves at creation.
         const vq = curve.virtual_quote_reserves;
         const vt = curve.virtual_token_reserves;
         if (c.vt0 <= 0n || c.vq0 <= 0n || vt <= 0n) continue;
         const runup = (vq * c.vt0 * BPS) / (vt * c.vq0);
-        if (runup < BPS + BigInt(p.minRunupBps) || runup > BPS + BigInt(p.maxRunupBps)) continue;
+        if (!runupInRange(runup, p)) continue;
+        // Flow gate: the runup must be backed by fresh money, not one wallet.
         const fl = flow(c, state.slot);
-        if (fl.net < BigInt(Math.floor(p.minFlowSol * LAMPORTS)) || fl.buyers < p.minBuyers) continue;
+        if (!meetsFlow(fl.net, fl.buyers, p)) continue;
         // Size: the stake, capped at 1% of real reserves and by free cash.
         const maxBuy = state.maxBuyLamports(c.mint);
-        let amount = p.stakeLamports < maxBuy ? p.stakeLamports : maxBuy;
+        const amount = sizeBuy(maxBuy, p);
         if (amount < p.minBuyLamports) continue;
         if (free < amount + tx) continue;
         orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: p.buySlippageBps });
